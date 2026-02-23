@@ -226,6 +226,6 @@ app.post('/run', async (req, res) => {
   }
 })
 
-app.listen(PORT, () => {
-  console.log(`Browser worker listening on port ${PORT}`)
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Browser worker listening on 0.0.0.0:${PORT}`)
 })

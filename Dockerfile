@@ -4,6 +4,6 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev
 COPY src ./src
+# Do NOT set ENV PORT here — Railway (and Render/Fly) inject PORT; the app uses process.env.PORT.
 EXPOSE 3030
-ENV PORT=3030
 CMD ["node", "src/index.js"]
