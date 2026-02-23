@@ -4,7 +4,9 @@ Runs Playwright in a long-lived process. Deploy to **Railway**, **Render**, or *
 
 ## Endpoints
 
+- **GET /** – Status page (links to /health and /logs).
 - **GET /health** – Returns `{ ok: true }`.
+- **GET /logs** – Recent request/error log (HTML table) for debugging.
 - **POST /run** – Run a sequence of browser steps.
   - Body: `{ "steps": [ { "action": "navigate", "url": "https://..." }, { "action": "fill", "selector": "#email", "value": "..." }, ... ] }`
   - Actions: `navigate` (requires `url`), `snapshot` (screenshot only), `click` (requires `selector`), `fill` (requires `selector`, optional `value`).

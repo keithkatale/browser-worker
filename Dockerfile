@@ -1,5 +1,5 @@
-# Playwright Chromium on Node for Railway / Render / Fly.io
-FROM mcr.microsoft.com/playwright:v1.49.0-noble
+# Playwright Chromium on Node for Railway / Render / Fly.io (version must match package.json)
+FROM mcr.microsoft.com/playwright:v1.58.2-noble
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev
