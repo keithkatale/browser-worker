@@ -312,6 +312,99 @@ app.post('/run', async (req, res) => {
   }
 })
 
+/**
+ * GET /session/:sessionId/screenshot
+ * Returns current screenshot + URL + title for the live browser panel.
+ */
+app.get('/session/:sessionId/screenshot', async (req, res) => {
+  if (!checkAuth(req, res)) return
+  const { sessionId } = req.params
+  const entry = sessions.get(sessionId)
+  if (!entry) return res.status(404).json({ success: false, error: 'Session not found' })
+  try {
+    const buf = await entry.page.screenshot({ type: 'png', encoding: 'base64', fullPage: false })
+    const screenshotBase64 = typeof buf === 'string' ? buf : buf?.toString?.('base64') ?? null
+    const url = entry.page.url()
+    const title = await entry.page.title().catch(() => '')
+    res.json({ success: true, screenshotBase64, url, title, sessionId })
+  } catch (e) {
+    res.status(500).json({ success: false, error: e?.message || String(e) })
+  }
+})
+
+/**
+ * GET /session/:sessionId/info
+ * Returns current URL + title without taking a screenshot.
+ */
+app.get('/session/:sessionId/info', async (req, res) => {
+  if (!checkAuth(req, res)) return
+  const { sessionId } = req.params
+  const entry = sessions.get(sessionId)
+  if (!entry) return res.status(404).json({ success: false, error: 'Session not found' })
+  try {
+    const url = entry.page.url()
+    const title = await entry.page.title().catch(() => '')
+    res.json({ success: true, url, title, sessionId })
+  } catch (e) {
+    res.status(500).json({ success: false, error: e?.message || String(e) })
+  }
+})
+
+/**
+ * POST /session/:sessionId/interact
+ * User-driven interaction endpoint for the human-handoff flow (login, CAPTCHA, etc.).
+ * Body: { action: 'click'|'type'|'navigate'|'key'|'scroll', x?, y?, text?, url?, key? }
+ */
+app.post('/session/:sessionId/interact', async (req, res) => {
+  if (!checkAuth(req, res)) return
+  const { sessionId } = req.params
+  const entry = sessions.get(sessionId)
+  if (!entry) return res.status(404).json({ success: false, error: 'Session not found' })
+
+  const { action, x, y, text, url: targetUrl, key } = req.body || {}
+  const { page } = entry
+  entry.lastUsedAt = Date.now()
+
+  try {
+    if (action === 'click') {
+      if (typeof x !== 'number' || typeof y !== 'number') {
+        return res.status(400).json({ success: false, error: 'x and y required for click' })
+      }
+      await page.mouse.click(x, y)
+    } else if (action === 'type') {
+      if (typeof text !== 'string') {
+        return res.status(400).json({ success: false, error: 'text required for type' })
+      }
+      await page.keyboard.type(text, { delay: 30 })
+    } else if (action === 'key') {
+      if (typeof key !== 'string') {
+        return res.status(400).json({ success: false, error: 'key required for key action' })
+      }
+      await page.keyboard.press(key)
+    } else if (action === 'navigate') {
+      if (typeof targetUrl !== 'string') {
+        return res.status(400).json({ success: false, error: 'url required for navigate' })
+      }
+      await page.goto(targetUrl, { waitUntil: 'load', timeout: 60000 })
+    } else if (action === 'scroll') {
+      if (typeof x !== 'number' || typeof y !== 'number') {
+        return res.status(400).json({ success: false, error: 'x and y (delta) required for scroll' })
+      }
+      await page.mouse.wheel(x, y)
+    } else {
+      return res.status(400).json({ success: false, error: `Unknown action: ${action}` })
+    }
+
+    const buf = await page.screenshot({ type: 'png', encoding: 'base64', fullPage: false })
+    const screenshotBase64 = typeof buf === 'string' ? buf : buf?.toString?.('base64') ?? null
+    const currentUrl = page.url()
+    const title = await page.title().catch(() => '')
+    res.json({ success: true, screenshotBase64, url: currentUrl, title, sessionId })
+  } catch (e) {
+    res.status(500).json({ success: false, error: e?.message || String(e) })
+  }
+})
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Browser worker listening on 0.0.0.0:${PORT}`)
 })
