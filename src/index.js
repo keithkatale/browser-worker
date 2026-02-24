@@ -4,13 +4,21 @@
  * - GET / — status page with link to /logs
  * - GET /health — health check
  * - GET /logs — recent request/error log (for debugging)
- * - POST /run (JSON body: { steps }) → runs steps, returns JSON with all step results + screenshots
+ * - POST /run (JSON body: { sessionId?, steps }) → runs steps, returns JSON with steps + sessionId (sessions persist for TTL)
  * - POST /run?stream=1 (same body) → SSE stream: one event per step (stepIndex, action, screenshotBase64)
+ * - DELETE /session/:sessionId — close a session
+ *
+ * Sessions: pass sessionId to reuse the same browser; omit to create a new one. Response always includes sessionId.
+ * Wait: navigate supports waitUntil ('domcontentloaded'|'load'|'networkidle') and timeout; action "wait" supports delay and/or selector.
+ * Stealth: uses playwright-extra + puppeteer-extra-plugin-stealth to reduce bot detection.
  */
 
 import express from 'express'
 import cors from 'cors'
-import { chromium } from 'playwright'
+import { chromium } from 'playwright-extra'
+import StealthPlugin from 'puppeteer-extra-plugin-stealth'
+
+chromium.use(StealthPlugin())
 
 const app = express()
 app.use(cors())
@@ -18,9 +26,13 @@ app.use(express.json({ limit: '1mb' }))
 
 const PORT = Number(process.env.PORT) || 3030
 const SECRET = process.env.BROWSER_WORKER_SECRET?.trim() || null
+const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS) || 15 * 60 * 1000 // 15 min
 
 const MAX_LOG_ENTRIES = 100
 const logEntries = []
+
+// sessionId -> { browser, context, page, lastUsedAt }
+const sessions = new Map()
 
 function log(level, message, meta = {}) {
   const entry = {
@@ -49,6 +61,64 @@ function checkAuth(req, res) {
   return true
 }
 
+function randomId() {
+  return `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
+}
+
+async function createNewSession(sessionId) {
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled',
+    ],
+  })
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 720 },
+    ignoreHTTPSErrors: true,
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  })
+  const page = await context.newPage()
+  const entry = { browser, context, page, lastUsedAt: Date.now() }
+  sessions.set(sessionId, entry)
+  log('info', 'Session created', { sessionId })
+  return entry
+}
+
+async function getOrCreateSession(requestedId) {
+  const existing = requestedId ? sessions.get(requestedId) : null
+  if (existing) {
+    existing.lastUsedAt = Date.now()
+    return { sessionId: requestedId, ...existing }
+  }
+  const id = requestedId || randomId()
+  const entry = await createNewSession(id)
+  return { sessionId: id, ...entry }
+}
+
+function closeSession(sessionId) {
+  const entry = sessions.get(sessionId)
+  if (!entry) return
+  sessions.delete(sessionId)
+  entry.browser.close().catch(() => {})
+  log('info', 'Session closed', { sessionId })
+}
+
+function cleanupExpiredSessions() {
+  const now = Date.now()
+  for (const [id, entry] of sessions.entries()) {
+    if (now - entry.lastUsedAt > SESSION_TTL_MS) {
+      closeSession(id)
+    }
+  }
+}
+
+// Run every 2 minutes
+setInterval(cleanupExpiredSessions, 2 * 60 * 1000)
+
 app.get('/', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8')
   res.send(`
@@ -57,18 +127,18 @@ app.get('/', (req, res) => {
 <head><meta charset="utf-8"><title>Browser Worker</title></head>
 <body style="font-family:system-ui;max-width:640px;margin:2rem auto;padding:1rem;">
   <h1>Terabits Browser Worker</h1>
-  <p>Playwright worker for navigate / snapshot / click / fill. Use with Terabits app.</p>
+  <p>Playwright worker for navigate / snapshot / click / fill / wait. Uses sessions and stealth.</p>
   <ul>
     <li><a href="/health">/health</a> — health check</li>
     <li><a href="/logs">/logs</a> — recent logs and errors</li>
   </ul>
-  <p><small>POST /run with body <code>{"steps":[...]}</code> to run browser steps.</small></p>
+  <p><small>POST /run with body <code>{"steps":[...]}</code> or <code>{"sessionId":"...", "steps":[...]}</code>. Response includes sessionId for reuse.</small></p>
 </body>
 </html>`)
 })
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'terabits-browser-worker' })
+  res.json({ ok: true, service: 'terabits-browser-worker', sessions: sessions.size })
 })
 
 app.get('/logs', (req, res) => {
@@ -105,10 +175,18 @@ function escapeHtml(s) {
     .replace(/"/g, '&quot;')
 }
 
+app.delete('/session/:sessionId', (req, res) => {
+  if (!checkAuth(req, res)) return
+  const { sessionId } = req.params
+  if (!sessionId) return res.status(400).json({ success: false, error: 'sessionId required' })
+  closeSession(sessionId)
+  res.json({ success: true, message: 'Session closed' })
+})
+
 app.post('/run', async (req, res) => {
   if (!checkAuth(req, res)) return
   const stream = req.query.stream === '1' || req.headers.accept === 'text/event-stream'
-  const { steps } = req.body || {}
+  const { steps, sessionId: requestedSessionId } = req.body || {}
 
   if (!Array.isArray(steps) || steps.length === 0) {
     log('warn', 'POST /run missing steps')
@@ -119,10 +197,9 @@ app.post('/run', async (req, res) => {
     return res.status(400).json({ success: false, error: 'max 15 steps' })
   }
 
-  log('info', 'POST /run start', { stepCount: steps.length })
+  log('info', 'POST /run start', { stepCount: steps.length, sessionId: requestedSessionId || 'new' })
   const results = []
-  let browser
-  let page
+  let resolvedSessionId
 
   const emitStep = (payload) => {
     results.push(payload)
@@ -141,15 +218,8 @@ app.post('/run', async (req, res) => {
       res.flushHeaders?.()
     }
 
-    browser = await chromium.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-    })
-    const context = await browser.newContext({
-      viewport: { width: 1280, height: 720 },
-      ignoreHTTPSErrors: true,
-    })
-    page = await context.newPage()
+    const { sessionId: sid, page } = await getOrCreateSession(requestedSessionId || null)
+    resolvedSessionId = sid
 
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i]
@@ -160,7 +230,25 @@ app.post('/run', async (req, res) => {
       try {
         if (action === 'navigate') {
           const url = step.url || 'about:blank'
-          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 })
+          const waitUntil = step.waitUntil || 'load'
+          const timeout = step.timeout ?? 60000
+          if (!['domcontentloaded', 'load', 'networkidle'].includes(waitUntil)) {
+            throw new Error(`waitUntil must be domcontentloaded, load, or networkidle, got: ${waitUntil}`)
+          }
+          await page.goto(url, { waitUntil, timeout })
+        } else if (action === 'wait') {
+          const delay = step.delay
+          const selector = step.selector
+          const selectorTimeout = step.selectorTimeout ?? 15000
+          if (typeof delay === 'number' && delay > 0) {
+            await new Promise((r) => setTimeout(r, delay))
+          }
+          if (selector) {
+            await page.waitForSelector(selector, { state: 'visible', timeout: selectorTimeout })
+          }
+          if (typeof delay !== 'number' && !selector) {
+            throw new Error('wait action requires delay (ms) and/or selector')
+          }
         } else if (action === 'click') {
           const selector = step.selector
           if (!selector) throw new Error('selector required for click')
@@ -171,7 +259,6 @@ app.post('/run', async (req, res) => {
           if (!selector) throw new Error('selector required for fill')
           await page.fill(selector, value, { timeout: 10000 })
         }
-        // snapshot: just take screenshot; navigate/click/fill also get a screenshot below
         const buf = await page.screenshot({
           type: 'png',
           encoding: 'base64',
@@ -197,19 +284,19 @@ app.post('/run', async (req, res) => {
       emitStep(payload)
     }
 
-    log('info', 'POST /run success', { stepCount: results.length })
+    log('info', 'POST /run success', { stepCount: results.length, sessionId: resolvedSessionId })
     if (stream) {
-      res.write(sseEvent({ type: 'done', success: true, steps: results }))
+      res.write(sseEvent({ type: 'done', success: true, steps: results, sessionId: resolvedSessionId }))
       res.end()
     } else {
-      res.json({ success: true, steps: results })
+      res.json({ success: true, steps: results, sessionId: resolvedSessionId })
     }
   } catch (err) {
     const msg = err?.message || String(err)
     log('error', 'POST /run failed', { error: msg })
     if (stream && res.headersSent) {
       try {
-        res.write(sseEvent({ type: 'done', success: false, error: msg, steps: results }))
+        res.write(sseEvent({ type: 'done', success: false, error: msg, steps: results, sessionId: resolvedSessionId }))
         res.end()
       } catch (_) {
         res.end()
@@ -219,10 +306,9 @@ app.post('/run', async (req, res) => {
         success: false,
         error: msg,
         steps: results,
+        sessionId: resolvedSessionId ?? undefined,
       })
     }
-  } finally {
-    if (browser) await browser.close().catch(() => {})
   }
 })
 
