@@ -406,6 +406,57 @@ app.post('/session/:sessionId/interact', async (req, res) => {
 })
 
 /**
+ * POST /session/:sessionId/smart-fill
+ * Fills a form using Playwright smart locators (label → placeholder → CSS).
+ * No pixel coordinates needed — much more reliable than coordinate-based clicks.
+ */
+app.post('/session/:sessionId/smart-fill', async (req, res) => {
+  if (!checkAuth(req, res)) return
+  const { sessionId } = req.params
+  const entry = sessions.get(sessionId)
+  if (!entry) return res.status(404).json({ success: false, error: 'Session not found' })
+
+  const { fields = [], submitLabel, submitSelector, waitAfterMs = 3000 } = req.body || {}
+  const { page } = entry
+  entry.lastUsedAt = Date.now()
+  const filled = [], errors = []
+
+  try {
+    for (const field of fields) {
+      const { label, placeholder, selector, value = '' } = field
+      try {
+        let locator = null
+        if (label) { locator = page.getByLabel(label, { exact: false }); if (!(await locator.count())) locator = null }
+        if (!locator && placeholder) { locator = page.getByPlaceholder(placeholder, { exact: false }); if (!(await locator.count())) locator = null }
+        if (!locator && selector) { locator = page.locator(selector); if (!(await locator.count())) locator = null }
+        if (!locator) { errors.push({ field: label || placeholder || selector, error: 'Could not locate field' }); continue }
+        await locator.first().click({ timeout: 5000 })
+        await locator.first().fill(value, { timeout: 5000 })
+        filled.push(label || placeholder || selector)
+      } catch (e) {
+        errors.push({ field: label || placeholder || selector, error: e?.message || String(e) })
+      }
+    }
+    let submitted = false
+    if (submitLabel) {
+      try { const btn = page.getByRole('button', { name: new RegExp(submitLabel, 'i') }); if (await btn.count()) { await btn.first().click({ timeout: 8000 }); submitted = true } } catch {}
+    }
+    if (!submitted && submitSelector) {
+      try { await page.click(submitSelector, { timeout: 8000 }); submitted = true } catch {}
+    }
+    if (!submitted) { try { await page.keyboard.press('Enter'); submitted = true } catch {} }
+    if (submitted && waitAfterMs > 0) {
+      await Promise.race([page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: waitAfterMs }).catch(() => {}), new Promise(r => setTimeout(r, waitAfterMs))])
+    }
+    const buf = await page.screenshot({ type: 'jpeg', quality: 70, encoding: 'base64', fullPage: false })
+    const screenshotBase64 = typeof buf === 'string' ? buf : buf?.toString?.('base64') ?? null
+    res.json({ success: true, filled, errors, submitted, screenshotBase64, url: page.url(), title: await page.title().catch(() => ''), sessionId })
+  } catch (e) {
+    res.status(500).json({ success: false, error: e?.message || String(e), filled, errors })
+  }
+})
+
+/**
  * GET /session/:sessionId/stream
  * SSE endpoint — pushes JPEG screenshots every 300ms when the page changes.
  */
