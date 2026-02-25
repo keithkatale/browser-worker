@@ -405,6 +405,97 @@ app.post('/session/:sessionId/interact', async (req, res) => {
   }
 })
 
+/**
+ * GET /session/:sessionId/stream
+ * SSE endpoint — pushes JPEG screenshots every 300ms when the page changes.
+ */
+app.get('/session/:sessionId/stream', async (req, res) => {
+  if (!checkAuth(req, res)) return
+  const { sessionId } = req.params
+  const entry = sessions.get(sessionId)
+  if (!entry) return res.status(404).json({ success: false, error: 'Session not found' })
+
+  res.setHeader('Content-Type', 'text/event-stream')
+  res.setHeader('Cache-Control', 'no-cache, no-transform')
+  res.setHeader('Connection', 'keep-alive')
+  res.setHeader('X-Accel-Buffering', 'no')
+  res.flushHeaders?.()
+
+  let lastHash = ''
+  let active = true
+
+  const push = async () => {
+    if (!active) return
+    const e = sessions.get(sessionId)
+    if (!e) { res.write(`data: ${JSON.stringify({ type: 'session_closed' })}\n\n`); res.end(); active = false; return }
+    try {
+      const buf = await e.page.screenshot({ type: 'jpeg', quality: 60, fullPage: false })
+      const b64 = typeof buf === 'string' ? buf : buf.toString('base64')
+      const hash = b64.slice(0, 32)
+      if (hash !== lastHash) {
+        lastHash = hash
+        res.write(`data: ${JSON.stringify({ type: 'frame', screenshotBase64: b64, url: e.page.url(), sessionId })}\n\n`)
+      }
+    } catch { /* skip frame during navigation */ }
+  }
+
+  const interval = setInterval(push, 300)
+  const keepalive = setInterval(() => { if (active) res.write(': keepalive\n\n') }, 15_000)
+  req.on('close', () => { active = false; clearInterval(interval); clearInterval(keepalive) })
+})
+
+/**
+ * GET /session/:sessionId/state
+ * Returns Playwright storageState (cookies + localStorage) for persistence.
+ */
+app.get('/session/:sessionId/state', async (req, res) => {
+  if (!checkAuth(req, res)) return
+  const { sessionId } = req.params
+  const entry = sessions.get(sessionId)
+  if (!entry) return res.status(404).json({ success: false, error: 'Session not found' })
+  try {
+    const storageState = await entry.context.storageState()
+    const url = entry.page.url()
+    const title = await entry.page.title().catch(() => '')
+    res.json({ success: true, storageState, url, title, sessionId })
+  } catch (e) {
+    res.status(500).json({ success: false, error: e?.message || String(e) })
+  }
+})
+
+/**
+ * POST /sessions/restore
+ * Creates a new browser session pre-loaded with saved cookies/localStorage.
+ * Body: { storageState, startUrl? }
+ */
+app.post('/sessions/restore', async (req, res) => {
+  if (!checkAuth(req, res)) return
+  const { storageState, startUrl } = req.body || {}
+  if (!storageState) return res.status(400).json({ success: false, error: 'storageState required' })
+  try {
+    const sessionId = randomId()
+    const browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
+    })
+    const context = await browser.newContext({
+      viewport: { width: 1280, height: 720 },
+      ignoreHTTPSErrors: true,
+      storageState,
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    })
+    const page = await context.newPage()
+    if (startUrl) await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {})
+    sessions.set(sessionId, { browser, context, page, lastUsedAt: Date.now() })
+    log('info', 'Session restored from saved state', { sessionId, startUrl })
+    const url = page.url()
+    const title = await page.title().catch(() => '')
+    res.json({ success: true, sessionId, url, title })
+  } catch (e) {
+    res.status(500).json({ success: false, error: e?.message || String(e) })
+  }
+})
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Browser worker listening on 0.0.0.0:${PORT}`)
 })
